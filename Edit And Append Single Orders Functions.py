@@ -179,6 +179,6 @@ def run_append_both():
 # ENTRYPOINT
 # Uncomment what you want to run
 # ==========================================
-run_append_AMS()
+#run_append_AMS()
 # run_append_Vast()
 # run_append_both()
