@@ -8,6 +8,8 @@ __pycache__/
 venv/
 # IDE
 .idea/
+# Local tools
+.tools/
 # Secrets
 .env
 # OS
