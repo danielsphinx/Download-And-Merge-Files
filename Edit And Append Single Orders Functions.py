@@ -57,8 +57,12 @@ def append_matching_columns(
         raise ValueError(f"Missing key columns: {missing}")
 
     # Build normalized dedupe keys
-    df_input["_key"] = df_input[list(key_cols)].astype(str).agg(" | ".join, axis=1).str.strip().str.lower()
-    df_target["_key"] = df_target[list(key_cols)].astype(str).agg(" | ".join, axis=1).str.strip().str.lower()
+    df_input["_key"] = df_input[list(key_cols)].fillna("").astype(str).apply(
+        lambda row: " | ".join(row).strip().lower(), axis=1
+    )
+    df_target["_key"] = df_target[list(key_cols)].fillna("").astype(str).apply(
+        lambda row: " | ".join(row).strip().lower(), axis=1
+    )
 
     # Remove duplicates already repeated inside input
     before_input = len(df_input)
@@ -96,8 +100,9 @@ def append_matching_columns(
     # Example skipped keys for clear logging
     duplicate_examples = (
         skipped_dupe_rows[list(key_cols)]
+        .fillna("")
         .astype(str)
-        .agg(" | ".join, axis=1)
+        .apply(lambda row: " | ".join(row), axis=1)
         .head(max_duplicate_examples)
         .tolist()
     )
@@ -136,10 +141,6 @@ HISTORY_LOG = rf"{BASE}\append_history.txt"
 
 # ==========================================
 # RUN FUNCTIONS
-# Keep same structure as your old script
-# IMPORTANT:
-# Change key_cols if your real unique row should use
-# something like ("Order ID", "SKU") or ("Name", "Lineitem sku")
 # ==========================================
 def run_append_AMS():
     append_matching_columns(
@@ -174,11 +175,3 @@ def run_append_both():
         last_log=LAST_LOG,
         history_log=HISTORY_LOG
     )
-
-# ==========================================
-# ENTRYPOINT
-# Uncomment what you want to run
-# ==========================================
-#run_append_AMS()
-# run_append_Vast()
-# run_append_both()

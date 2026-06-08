@@ -1,336 +1,177 @@
 import pandas as pd
-import re
-import warnings
+from datetime import datetime
 
-# Example: Use case-specific header configurations
-shopify_required_headers = [
-    "Sales Channel", "Order Number", "Date", "Buyer", "Price", "Tax",
-    "Tax Remitted", "Shipping", "Shipping Type", "Products", "Quantity",
-    "Retail ID", "Street 1", "Street 2", "City", "State", "ZIP Code",
-    "Merchant Order Reference", "Order Status", "Invoice origin",
-    "Receiver ID", "Country", "Bundle SKUs",
-    "Full Items Cost Without Base Shipping For Profit Calculation",
-    "Estimated Profit", "Order Earnings", "Order SKU",
-    "Buyer Requested Cancel", "Is Replacement Order", "Full Order ID"
-]
+# ==========================================
+# SAFE CSV READER
+# Tries common encodings used by Excel / messy CSVs
+# ==========================================
+def read_csv_safe(path):
+    for enc in ("utf-8-sig", "cp1252", "latin1"):
+        try:
+            df = pd.read_csv(path, encoding=enc, dtype=str, engine="python", on_bad_lines="warn").fillna("")
+            print(f"Loaded with {enc}: {path}")
+            return df
+        except Exception as e:
+            print(f"Failed with {enc}: {path} -> {e}")
+    raise ValueError(f"Could not read file: {path}")
 
-marketplace_required_headers = [
-    "Sales Channel", "Order ID", "Date", "Buyer", "Price", "Tax",
-    "Tax Remitted", "Shipping", "Shipping Type", "Products", "Quantity",
-    "Retail ID", "Street 1", "Street 2", "City", "State", "ZIP Code",
-    "Merchant Order Reference", "Order Status", "Invoice origin",
-    "Receiver ID", "Country", "Bundle SKUs",
-    "Full Items Cost Without Base Shipping For Profit Calculation",
-    "Estimated Profit", "Order Earnings", "Order SKU",
-    "Buyer Requested Cancel", "Is Replacement Order", "Full Order ID"
-]
+# ==========================================
+# WRITE LOGS
+# - last_log: overwritten every run
+# - history_log: appended forever
+# ==========================================
+def write_logs(last_log, history_log, text):
+    with open(last_log, "w", encoding="utf-8-sig") as f:
+        f.write(text)
+    with open(history_log, "a", encoding="utf-8-sig") as f:
+        f.write(text + "\n" + "=" * 100 + "\n\n")
 
-def process_orders(input_file, output_file, required_headers):
-    """
-    Ensure all required headers exist, reorder columns, and save as UTF-8. Only updates columns, never rows.
-    """
-    df = pd.read_csv(input_file, dtype=str)
+# ==========================================
+# MAIN APPEND FUNCTION
+# - matches input columns to target
+# - prevents duplicate appends
+# - logs clearly what was added / skipped
+# ==========================================
+def append_matching_columns(
+    input_file,
+    target_file,
+    output_file=None,
+    key_cols=("Order ID", "Buyer"),
+    last_log=None,
+    history_log=None,
+    max_duplicate_examples=25
+):
+    # Read both files
+    df_input = read_csv_safe(input_file)
+    df_target = read_csv_safe(target_file)
 
-    for header in required_headers:
-        if header not in df.columns:
-            df[header] = None
-    df = df[required_headers]
-    df.to_csv(output_file, index=False, encoding='utf-8')
+    original_input_rows = len(df_input)
+    original_target_rows = len(df_target)
 
-def order_inventory_match(order_file, barcode_file, required_headers, output_file=None):
-    """
-    Matches barcodes in an order file (from Retail ID or Bundle SKUs) to a barcode/quantity file.
-    Groups by order number/id to compute one "In Hand" summary per order.
-    BUT: Output rows are the original order rows (no row merging), just with
-    "In Hand Data" and "In Hand" appended.
-    """
+    # Force input schema to match target schema
+    df_input = df_input.reindex(columns=df_target.columns, fill_value="")
 
-    # -----------------------------
-    # 1. Load orders
-    # -----------------------------
-    orders = pd.read_csv(order_file, dtype=str)
-    print("Loaded orders:", len(orders))
-    print("Columns in orders:", orders.columns)
+    # Make sure dedupe columns exist in both files
+    missing = [c for c in key_cols if c not in df_input.columns or c not in df_target.columns]
+    if missing:
+        raise ValueError(f"Missing key columns: {missing}")
 
-    if 'Bundle SKUs' in orders.columns:
-        print("Sample Bundle SKUs:", orders['Bundle SKUs'].dropna().unique()[:5])
-    if 'Retail ID' in orders.columns:
-        print("Sample Retail IDs:", orders['Retail ID'].dropna().unique()[:5])
+    # Build normalized dedupe keys
+    df_input["_key"] = df_input[list(key_cols)].fillna("").astype(str).apply(
+        lambda row: " | ".join(row).strip().lower(), axis=1
+    )
+    df_target["_key"] = df_target[list(key_cols)].fillna("").astype(str).apply(
+        lambda row: " | ".join(row).strip().lower(), axis=1
+    )
 
-    if orders.empty or orders.shape[0] == 0:
-        print("⚠️ No orders found in the file. Skipping matching.")
-        # Still ensure headers + empty In Hand cols and write out
-        final_result = orders.copy()
-        if 'In Hand Data' not in final_result.columns:
-            final_result['In Hand Data'] = ''
-        if 'In Hand' not in final_result.columns:
-            final_result['In Hand'] = ''
+    # Remove duplicates already repeated inside input
+    before_input = len(df_input)
+    df_input = df_input.drop_duplicates("_key", keep="first")
+    input_dups_removed = before_input - len(df_input)
 
-        for header in required_headers:
-            if header not in final_result.columns:
-                final_result[header] = ''
+    # Remove duplicates already repeated inside target
+    before_target = len(df_target)
+    df_target = df_target.drop_duplicates("_key", keep="first")
+    target_dups_removed = before_target - len(df_target)
 
-        output_columns = required_headers + ["In Hand Data", "In Hand"]
-        if not output_file:
-            output_file = order_file.rsplit('.', 1)[0] + '_matched_simple.csv'
-        final_result[output_columns].to_csv(output_file, index=False, encoding='utf-8')
-        print(f"Saved (empty orders): {output_file}")
-        return final_result
+    # Identify incoming rows that already exist in target
+    existing_keys = set(df_target["_key"])
+    skipped_dupe_rows = df_input[df_input["_key"].isin(existing_keys)].copy()
+    new_rows = df_input[~df_input["_key"].isin(existing_keys)].copy()
 
-    # Determine the order-id column once, from the original orders
-    if "Order ID" in orders.columns:
-        order_id_column = "Order ID"
-    elif "Order Number" in orders.columns:
-        order_id_column = "Order Number"
-    else:
-        raise Exception("No suitable order number column found in orders!")
+    skipped_existing = len(skipped_dupe_rows)
+    added_rows = len(new_rows)
 
-    # -----------------------------
-    # 2. Load inventory barcode/qty
-    # -----------------------------
-    barcode_qty = pd.read_csv(barcode_file, dtype=str)
-    barcode_qty.columns = [c.strip() for c in barcode_qty.columns]
+    # Append only truly new rows
+    combined = pd.concat([df_target, new_rows], ignore_index=True).drop(columns="_key", errors="ignore")
 
-    barcode_col = next((c for c in barcode_qty.columns if "barcode" in c.lower()), "Barcode")
-    qty_col = next((c for c in barcode_qty.columns
-                    if "qty" in c.lower() or "quantity" in c.lower()), "Quantity")
+    # Save cleaned / updated file
+    save_path = output_file or target_file
+    combined.to_csv(save_path, index=False, encoding="utf-8-sig")
+    total_rows = len(combined)
 
-    print("barcode_qty columns:", barcode_qty.columns)
+    # Console output
+    print(f"Added {added_rows} new rows -> {save_path}")
+    print(f"Skipped {skipped_existing} NEW incoming rows because they already existed in target")
+    print(f"Removed {input_dups_removed} duplicate rows inside input")
+    print(f"Removed {target_dups_removed} duplicate rows inside target")
+    print(f"Total rows now: {total_rows}")
 
-    barcode_qty[barcode_col] = (
-        barcode_qty[barcode_col]
+    # Example skipped keys for clear logging
+    duplicate_examples = (
+        skipped_dupe_rows[list(key_cols)]
+        .fillna("")
         .astype(str)
-        .str.strip()
-        .str.lstrip('0')
+        .apply(lambda row: " | ".join(row), axis=1)
+        .head(max_duplicate_examples)
+        .tolist()
+    )
+    duplicate_examples_text = "\n".join(f"- {x}" for x in duplicate_examples) if duplicate_examples else "None"
+    more_note = f"\n...and {skipped_existing - max_duplicate_examples} more not shown." if skipped_existing > max_duplicate_examples else ""
+
+    # Build log text
+    log_text = (
+        f"Time: {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        f"Input File: {input_file}\n"
+        f"Target File: {target_file}\n"
+        f"Saved File: {save_path}\n"
+        f"Key Columns: {', '.join(key_cols)}\n\n"
+        f"INPUT ROWS BEFORE CLEANING: {original_input_rows}\n"
+        f"DUPLICATE ROWS REMOVED INSIDE INPUT FILE: {input_dups_removed}\n\n"
+        f"TARGET ROWS BEFORE CLEANING: {original_target_rows}\n"
+        f"DUPLICATE ROWS REMOVED INSIDE TARGET FILE: {target_dups_removed}\n\n"
+        f"NEW ROWS SUCCESSFULLY ADDED: {added_rows}\n"
+        f"WARNING: NEW INCOMING ROWS NOT ADDED BECAUSE THEY WERE DUPLICATES OF EXISTING TARGET ROWS: {skipped_existing}\n"
+        f"FINAL TOTAL ROWS IN SAVED FILE: {total_rows}\n\n"
+        f"DUPLICATE INCOMING ROW EXAMPLES (matched existing target rows):\n"
+        f"{duplicate_examples_text}{more_note}\n"
     )
 
-    barcode_qty = barcode_qty.rename(columns={qty_col: 'Inventory Quantity'})
-    barcode_qty['Inventory Quantity'] = pd.to_numeric(
-        barcode_qty['Inventory Quantity'], errors='coerce'
-    ).fillna(0)
+    # Write logs if paths provided
+    if last_log and history_log:
+        write_logs(last_log, history_log, log_text)
 
-    # -----------------------------
-    # 3. Extract barcodes per row
-    # -----------------------------
-    def extract_barcodes_and_qty(row):
-        quantity = int(row.get('Quantity', 1)) if str(row.get('Quantity', '')).isdigit() else 1
-        barcodes = []
+# ==========================================
+# PATHS
+# ==========================================
+BASE = r"G:\Automation Google Drive\Order Exports\Completed Orders"
+INPUT = rf"{BASE}\ExportedOneRowOrderLine.csv"
+LAST_LOG = rf"{BASE}\last_append.txt"
+HISTORY_LOG = rf"{BASE}\append_history.txt"
 
-        bundle_skus = row.get('Bundle SKUs', '')
-        retail_id = row.get('Retail ID', '')
-
-        if pd.notna(bundle_skus) and str(bundle_skus).strip() != "":
-            for code in str(bundle_skus).split(','):
-                code = code.strip().rstrip(',')
-                match = re.search(r'(\d{8,})', code)
-                if match:
-                    barcodes.append((match.group(1).lstrip('0'), quantity))
-        elif pd.notna(retail_id) and str(retail_id).strip() != "":
-            code = str(retail_id).strip()
-            match = re.search(r'(\d{8,})', code)
-            if match:
-                barcodes.append((match.group(1).lstrip('0'), quantity))
-
-        return barcodes
-
-    # Build a per-line expanded table: one row per (order, barcode)
-    records = []
-    for idx, row in orders.iterrows():
-        barcodes_and_qty = extract_barcodes_and_qty(row)
-        if barcodes_and_qty:
-            for bc, qty in barcodes_and_qty:
-                records.append({
-                    order_id_column: row.get(order_id_column, ''),
-                    'Matched Barcode': bc,
-                    'Order Quantity': qty
-                })
-
-    if not records:
-        # No barcodes in any row → just attach empty In Hand fields and bail
-        print("No barcodes found in any order line. Writing file with blank In Hand columns.")
-        final_result = orders.copy()
-        final_result['In Hand Data'] = ''
-        final_result['In Hand'] = ''
-        for header in required_headers:
-            if header not in final_result.columns:
-                final_result[header] = ''
-
-        output_columns = required_headers + ["In Hand Data", "In Hand"]
-        if not output_file:
-            output_file = order_file.rsplit('.', 1)[0] + '_matched_simple.csv'
-        final_result[output_columns].to_csv(output_file, index=False, encoding='utf-8')
-        print(f"Saved (no barcodes): {output_file}")
-        return final_result
-
-    matched_orders = pd.DataFrame(records)
-    print("matched_orders (expanded) rows:", len(matched_orders))
-    print("matched_orders columns:", matched_orders.columns)
-
-    # -----------------------------
-    # 4. Collapse duplicate barcodes per order (for summary ONLY)
-    # -----------------------------
-    barcode_level = matched_orders.copy()
-    barcode_level['Order Quantity'] = pd.to_numeric(
-        barcode_level['Order Quantity'], errors='coerce'
-    ).fillna(0)
-
-    # group by (Order, Barcode) and sum Order Quantity
-    grouped = (
-        barcode_level
-        .groupby([order_id_column, 'Matched Barcode'], dropna=False)['Order Quantity']
-        .sum()
-        .reset_index()
+# ==========================================
+# RUN FUNCTIONS
+# ==========================================
+def run_append_AMS():
+    append_matching_columns(
+        input_file=INPUT,
+        target_file=rf"{BASE}\AMS\Completed Orders With Profit.csv",
+        key_cols=("Order ID", "Buyer"),
+        last_log=LAST_LOG,
+        history_log=HISTORY_LOG
     )
 
-    # -----------------------------
-    # 5. Merge with inventory for per-barcode "have" quantity
-    # -----------------------------
-    result = grouped.merge(
-        barcode_qty[[barcode_col, 'Inventory Quantity']],
-        left_on='Matched Barcode',
-        right_on=barcode_col,
-        how='left'
+def run_append_Vast():
+    append_matching_columns(
+        input_file=INPUT,
+        target_file=rf"{BASE}\Vast\Completed Orders With Profit.csv",
+        key_cols=("Order ID", "Buyer"),
+        last_log=LAST_LOG,
+        history_log=HISTORY_LOG
     )
 
-    result['Inventory Quantity'] = pd.to_numeric(
-        result['Inventory Quantity'], errors='coerce'
-    ).fillna(0)
-
-    # -----------------------------
-    # 6. Order-level "In Hand" summary
-    # -----------------------------
-    def summarize_in_hand(group):
-        oos = []
-        in_hand = []
-        partial = []
-
-        for _, row in group.iterrows():
-            sku = str(row['Matched Barcode'])
-            if not sku or sku == 'nan':
-                continue  # skip if no usable barcode
-
-            need = row['Order Quantity']
-            have = row['Inventory Quantity']
-
-            try:
-                need = int(need)
-            except Exception:
-                need = 0
-            try:
-                have = int(have)
-            except Exception:
-                have = 0
-
-            if have >= need and need > 0:
-                in_hand.append(f"{sku}({need})")
-            elif have > 0 and need > 0 and have < need:
-                partial.append(f"{sku}({have} in hand, {need} need)")
-            elif need > 0:
-                oos.append(f"{sku}({need} need, {have} in hand)")
-
-        # ---- same logic you had before ----
-        if (oos or partial) and in_hand:
-            partial_summary = []
-            if partial:
-                partial_summary.append("Partial: " + ", ".join(partial))
-            if oos:
-                partial_summary.append("OOS: " + ", ".join(oos))
-            if in_hand:
-                partial_summary.append("In Hand: " + ", ".join(in_hand))
-            in_hand_data = " | ".join(partial_summary)
-            in_hand_flag = "Partial"
-        elif not oos and not partial and in_hand:
-            in_hand_data = "Fully In Hand"
-            in_hand_flag = True
-        elif not in_hand and not partial and oos:
-            in_hand_data = "OOS: " + ", ".join(oos)
-            in_hand_flag = False
-        elif partial:
-            in_hand_data = "Partial: " + ", ".join(partial)
-            in_hand_flag = "Partial"
-        elif not in_hand and not partial and not oos:
-            in_hand_data = ""
-            in_hand_flag = ""
-        else:
-            # fallback
-            parts = []
-            if partial:
-                parts.append("Partial: " + ", ".join(partial))
-            if oos:
-                parts.append("OOS: " + ", ".join(oos))
-            if in_hand:
-                parts.append("In Hand: " + ", ".join(in_hand))
-            in_hand_data = " | ".join(parts)
-            in_hand_flag = False
-
-        return pd.Series({'In Hand Data': in_hand_data, 'In Hand': in_hand_flag})
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=DeprecationWarning)
-        result_with_inhand = (
-            result
-            .groupby(order_id_column, dropna=False)
-            .apply(summarize_in_hand)
-            .reset_index()
-        )
-
-    # -----------------------------
-    # 7. Merge summary back into original orders
-    # -----------------------------
-    final_result = orders.merge(result_with_inhand, on=order_id_column, how='left')
-
-    # Fill NaNs in In Hand fields with blanks
-    if 'In Hand Data' not in final_result.columns:
-        final_result['In Hand Data'] = ''
-    else:
-        final_result['In Hand Data'] = final_result['In Hand Data'].fillna('')
-    if 'In Hand' not in final_result.columns:
-        final_result['In Hand'] = ''
-    else:
-        final_result['In Hand'] = final_result['In Hand'].fillna('')
-
-    # Ensure all required headers exist
-    for header in required_headers:
-        if header not in final_result.columns:
-            final_result[header] = ''
-
-    # -----------------------------
-    # 8. Output only required columns + In Hand
-    # -----------------------------
-    output_columns = required_headers + ["In Hand Data", "In Hand"]
-
-    # IMPORTANT: no drop_duplicates() here – we want a 1:1 with original rows
-    filtered_result = final_result[output_columns]
-
-    if not output_file:
-        output_file = order_file.rsplit('.', 1)[0] + '_matched_simple.csv'
-
-    filtered_result.to_csv(output_file, index=False, encoding='utf-8')
-    print(f"Saved: {output_file}")
-
-    return filtered_result
-
-# ----------- Main logic for both file types ---------------
-
-order_inventory_match(
-    "G:\\Automation Google Drive\\Order Exports\\Python Shopify Store Orders\\All Shopify Stores\\Merged Shopify Format Orders.csv",
-    "G:\\Automation Google Drive\\Wholesale UI CSVs\\Manual-ish Feed\\Barcode Scanner\\Google Sheet Inventory\\Inventory Barcode Scanner Sheet Pull.csv",
-    shopify_required_headers
-)
-
-order_inventory_match(
-    "G:\\Automation Google Drive\\Google Sheet Connected CSVs\\Pending Order Exports\\All Marketplaces\\All Pending Marketplace Orders For Ordering.csv",
-    "G:\\Automation Google Drive\\Wholesale UI CSVs\\Manual-ish Feed\\Barcode Scanner\\Google Sheet Inventory\\Inventory Barcode Scanner Sheet Pull.csv",
-    marketplace_required_headers
-)
-process_orders(
-    "G:\\Automation Google Drive\\Order Exports\\Python Shopify Store Orders\\All Shopify Stores\\Merged Shopify Format Orders.csv",
-    "G:\\Automation Google Drive\\Order Exports\\Python Shopify Store Orders\\All Shopify Stores\\Merged Shopify Format Orders.csv",
-    shopify_required_headers
-)
-
-process_orders(
-    "G:\\Automation Google Drive\\Google Sheet Connected CSVs\\Pending Order Exports\\All Marketplaces\\All Pending Marketplace Orders For Ordering.csv",
-    "G:\\Automation Google Drive\\Google Sheet Connected CSVs\\Pending Order Exports\\All Marketplaces\\All Pending Marketplace Orders For Ordering.csv",
-    marketplace_required_headers
-)
+def run_append_both():
+    append_matching_columns(
+        input_file=rf"{BASE}\AMS\Completed Orders With Profit.csv",
+        target_file=rf"{BASE}\All Orders Ordered With Profit\All Orders Ordered With Profit.csv",
+        key_cols=("Order ID", "Buyer"),
+        last_log=LAST_LOG,
+        history_log=HISTORY_LOG
+    )
+    append_matching_columns(
+        input_file=rf"{BASE}\Vast\Completed Orders With Profit.csv",
+        target_file=rf"{BASE}\All Orders Ordered With Profit\All Orders Ordered With Profit.csv",
+        key_cols=("Order ID", "Buyer"),
+        last_log=LAST_LOG,
+        history_log=HISTORY_LOG
+    )
